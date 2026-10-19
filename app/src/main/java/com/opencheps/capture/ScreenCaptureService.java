@@ -1,597 +1,2252 @@
-private static final long SAMPLE_PERIOD_MS = 150;
+package com.opencheps.capture;
 
-// Diagnose: Den Score anzeigen, ohne eine unkalibrierte 80%-Grenze.
-// UNKNOWN und unplausible Ergebnisse werden weiterhin abgelehnt.
-private static final double MIN_MOVE_CONFIDENCE = 0.0;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Intent;
+import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.SystemClock;
+import android.util.DisplayMetrics;
+import android.util.Log;
+import android.view.WindowManager;
 
+import androidx.annotation.Nullable;
+import androidx.core.app.NotificationCompat;
 
-private void sampleOnce(long now) throws Exception {
-    candidate.expire(now);
+import com.opencheps.R;
+import com.opencheps.engine.StockfishEngine;
+import com.opencheps.overlay.ArrowOverlayView;
+import com.opencheps.overlay.FloatingPanel;
+import com.opencheps.overlay.OverlayService;
+import com.opencheps.util.Prefs;
+import com.opencheps.util.Side;
+import com.opencheps.vision.BoardDetector;
+import com.opencheps.vision.FenBuilder;
+import com.opencheps.vision.MoveAnalyzer;
+import com.opencheps.vision.PieceClassifier;
 
-    if (reader == null || classifier == null) {
-        return;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class ScreenCaptureService extends Service {
+
+    private static final String TAG = "OC/Capture";
+    private static final String CHANNEL_ID = "opencheps_capture";
+
+    public static final String EXTRA_RESULT_CODE = "result_code";
+    public static final String EXTRA_RESULT_DATA = "result_data";
+    public static final String EXTRA_USER_SIDE = "user_side";
+    public static final String ACTION_STOP = "com.opencheps.STOP";
+
+    private static final long SAMPLE_PERIOD_MS = 400;
+    private static final long MAX_CONFIRM_GAP_MS = 1600;
+
+    private static final int REQUIRED_CONFIRMATIONS = 2;
+    private static final int LOST_BOARD_THRESHOLD = 6;
+
+    private static final int BEST_ARROW_COLOR = 0xFF00C853;
+    private static final float BEST_ARROW_WIDTH = 20f;
+
+    private MediaProjection projection;
+    private VirtualDisplay virtualDisplay;
+    private ImageReader reader;
+
+    private HandlerThread workerThread;
+    private Handler worker;
+    private Handler main;
+
+    private PieceClassifier classifier;
+
+    private StockfishEngine engine;
+    private boolean engineReady = false;
+
+    private int captureW;
+    private int captureH;
+    private int density;
+
+    private int screenW;
+    private int screenH;
+
+    private float capToScreenX = 1f;
+    private float capToScreenY = 1f;
+
+    private volatile boolean paused = false;
+    private volatile boolean busy = false;
+
+    private boolean started = false;
+
+    private Side userSide = Side.WHITE;
+
+    /*
+     * Welche Farbe nach unserem bestätigten
+     * Spielverlauf am Zug ist.
+     */
+    private Side expectedSide = Side.WHITE;
+
+    /*
+     * Letzte bestätigte interne Stellung.
+     */
+    private char[][] confirmedGrid;
+
+    /*
+     * Nach Kalibrierung bleiben die Brettkoordinaten
+     * fest, damit sie nicht ständig springen.
+     */
+    private BoardDetector.Board lockedBoard;
+
+    private int lostBoardCount = 0;
+
+    /*
+     * Nicht das komplette erkannte Brett muss zweimal
+     * gleich sein. Nur derselbe erkannte Zug.
+     */
+    private String pendingMoveKey = null;
+    private int pendingMoveCount = 0;
+    private long pendingMoveAt = 0;
+
+    private String lastMoveText = "";
+
+    private String lastEngineFen = "";
+
+    private List<ArrowOverlayView.Arrow> currentArrows =
+            new ArrayList<>();
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
     }
 
-    Bitmap bitmap = null;
+    @Override
+    public int onStartCommand(
+            Intent intent,
+            int flags,
+            int startId
+    ) {
 
-    try {
-        try (Image image = reader.acquireLatestImage()) {
-            if (image == null) {
-                return;
-            }
+        if (intent != null
+                && ACTION_STOP.equals(intent.getAction())) {
 
-            long timestamp = image.getTimestamp();
-
-            if (timestamp > 0 && timestamp == lastImageTimestamp) {
-                return;
-            }
-
-            lastImageTimestamp = timestamp;
-
-            if (image.getWidth() != captureW
-                    || image.getHeight() != captureH) {
-                candidate.reset();
-                return;
-            }
-
-            bitmap = imageToBitmap(image);
+            stopSelf();
+            return START_NOT_STICKY;
         }
 
-        if (stopping) {
-            return;
+        if (started) {
+            return START_NOT_STICKY;
         }
 
-        BoardDetector.Board detected =
-                BoardDetector.locate(bitmap);
+        if (intent == null) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
 
-        if (!validBoard(
-                detected,
-                bitmap.getWidth(),
-                bitmap.getHeight()
-        )) {
-            candidate.reset();
-            overlayBounds = null;
+        startInForeground();
 
-            lostBoardCount = Math.min(
-                    LOST_BOARD_THRESHOLD,
-                    lostBoardCount + 1
+        int resultCode =
+                intent.getIntExtra(
+                        EXTRA_RESULT_CODE,
+                        0
+                );
+
+        Intent data =
+                intent.getParcelableExtra(
+                        EXTRA_RESULT_DATA
+                );
+
+        if (data == null) {
+
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        String side =
+                intent.getStringExtra(
+                        EXTRA_USER_SIDE
+                );
+
+        if (side == null) {
+            side = Prefs.userSide(this);
+        }
+
+        userSide =
+                "b".equals(side)
+                        ? Side.BLACK
+                        : Side.WHITE;
+
+        main =
+                new Handler(
+                        getMainLooper()
+                );
+
+        workerThread =
+                new HandlerThread(
+                        "oc-worker"
+                );
+
+        workerThread.start();
+
+        worker =
+                new Handler(
+                        workerThread.getLooper()
+                );
+
+        classifier =
+                new PieceClassifier();
+
+        engine =
+                new StockfishEngine();
+
+        MediaProjectionManager manager =
+                (MediaProjectionManager)
+                        getSystemService(
+                                MEDIA_PROJECTION_SERVICE
+                        );
+
+        projection =
+                manager == null
+                        ? null
+                        : manager.getMediaProjection(
+                                resultCode,
+                                data
+                        );
+
+        if (projection == null) {
+
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        projection.registerCallback(
+                new MediaProjection.Callback() {
+
+                    @Override
+                    public void onStop() {
+                        stopSelf();
+                    }
+
+                },
+                worker
+        );
+
+        try {
+
+            setupVirtualDisplay();
+
+        } catch (Exception e) {
+
+            Log.e(
+                    TAG,
+                    "Virtual display failed",
+                    e
             );
 
-            if (lostBoardCount >= LOST_BOARD_THRESHOLD) {
-                statusText = "Brett nicht erkannt";
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        startService(
+                new Intent(
+                        this,
+                        OverlayService.class
+                )
+        );
+
+        started = true;
+
+        wirePanel();
+
+        /*
+         * Engine auf demselben Worker starten.
+         * Die Bilderkennung beginnt erst danach.
+         */
+        worker.post(() -> {
+
+            panelStatus(
+                    "Stockfish startet…"
+            );
+
+            try {
+
+                engine.start(
+                        getApplicationContext()
+                );
+
+                engineReady = true;
+
+                panelStatus(
+                        "Stockfish bereit · Startstellung zeigen"
+                );
+
+            } catch (Exception e) {
+
+                engineReady = false;
+
+                Log.e(
+                        TAG,
+                        "Stockfish start failed",
+                        e
+                );
+
+                panelStatus(
+                        "Stockfish-Fehler"
+                );
+
+                panelEval(
+                        "Engine konnte nicht gestartet werden"
+                );
+            }
+        });
+
+        worker.postDelayed(
+                sampleLoop,
+                800
+        );
+
+        return START_NOT_STICKY;
+    }
+
+    private void wirePanel() {
+
+        if (main == null) {
+            return;
+        }
+
+        main.post(
+                () -> tryWirePanel(0)
+        );
+    }
+
+    private void tryWirePanel(
+            int attempt
+    ) {
+
+        FloatingPanel panel =
+                OverlayService.panel();
+
+        if (panel == null) {
+
+            if (attempt < 12
+                    && main != null) {
+
+                main.postDelayed(
+                        () ->
+                                tryWirePanel(
+                                        attempt + 1
+                                ),
+                        250
+                );
             }
 
             return;
         }
+
+        panel.placeBottomLeft(
+                screenW,
+                screenH
+        );
+
+        panel.setUserSide(
+                userSide
+        );
+
+        panel.setListener(
+                new FloatingPanel.Listener() {
+
+                    @Override
+                    public void onPauseToggle(
+                            boolean isPaused
+                    ) {
+
+                        paused = isPaused;
+
+                        if (paused) {
+
+                            clearArrows();
+
+                            panelStatus(
+                                    "Pausiert"
+                            );
+
+                        } else {
+
+                            resetPendingMove();
+
+                            lastEngineFen = "";
+
+                            panelStatus(
+                                    "Fortgesetzt"
+                            );
+                        }
+                    }
+
+                    @Override
+                    public void onStop() {
+
+                        stopSelf();
+                    }
+
+                    @Override
+                    public void onRecalibrate() {
+
+                        if (worker == null) {
+                            return;
+                        }
+
+                        worker.post(() -> {
+
+                            classifier.reset();
+
+                            resetGameState();
+
+                            clearAll();
+
+                            panelStatus(
+                                    "Startstellung zeigen"
+                            );
+
+                            panelEval("");
+                        });
+                    }
+
+                    @Override
+                    public void onSideChange(
+                            Side newSide
+                    ) {
+
+                        Prefs.setUserSide(
+                                getApplicationContext(),
+                                newSide == Side.BLACK
+                                        ? "b"
+                                        : "w"
+                        );
+
+                        if (worker == null) {
+                            return;
+                        }
+
+                        worker.post(() -> {
+
+                            userSide =
+                                    newSide;
+
+                            classifier.reset();
+
+                            resetGameState();
+
+                            clearAll();
+
+                            panelStatus(
+                                    "Farbe geändert · neu kalibrieren"
+                            );
+
+                            panelEval("");
+                        });
+                    }
+                }
+        );
+    }
+
+    private void resetGameState() {
+
+        confirmedGrid = null;
+
+        lockedBoard = null;
+
+        expectedSide =
+                Side.WHITE;
 
         lostBoardCount = 0;
 
-        BoardDetector.Board board = detected;
+        lastMoveText = "";
 
-        if (classifier.isTrained() && lockedBoard != null) {
-            if (boardMovedTooFar(lockedBoard, detected)) {
-                candidate.reset();
-                overlayBounds = null;
+        lastEngineFen = "";
 
-                statusText = "Brett verschoben";
-                evalText =
-                        "Neu kalibrieren und Startstellung zeigen";
+        currentArrows.clear();
+
+        resetPendingMove();
+    }
+
+    private void resetPendingMove() {
+
+        pendingMoveKey = null;
+        pendingMoveCount = 0;
+        pendingMoveAt = 0;
+    }
+
+    private final Runnable sampleLoop =
+            new Runnable() {
+
+                @Override
+                public void run() {
+
+                    try {
+
+                        if (!paused) {
+
+                            sampleOnce();
+
+                        } else {
+
+                            drainReader();
+                        }
+
+                    } catch (Throwable t) {
+
+                        Log.e(
+                                TAG,
+                                "sample error",
+                                t
+                        );
+
+                        panelStatus(
+                                "Diagnose-Fehler"
+                        );
+                    }
+
+                    if (worker != null) {
+
+                        worker.postDelayed(
+                                this,
+                                SAMPLE_PERIOD_MS
+                        );
+                    }
+                }
+            };
+
+    private void drainReader() {
+
+        if (reader == null) {
+            return;
+        }
+
+        while (true) {
+
+            Image image;
+
+            try {
+
+                image =
+                        reader.acquireNextImage();
+
+            } catch (Exception e) {
+
+                break;
+            }
+
+            if (image == null) {
+                break;
+            }
+
+            image.close();
+        }
+    }
+
+    private void sampleOnce() {
+
+        if (busy
+                || reader == null) {
+
+            return;
+        }
+
+        Image image;
+
+        try {
+
+            image =
+                    reader.acquireLatestImage();
+
+        } catch (Exception e) {
+
+            return;
+        }
+
+        if (image == null) {
+            return;
+        }
+
+        busy = true;
+
+        Bitmap bitmap = null;
+
+        try {
+
+            bitmap =
+                    imageToBitmap(
+                            image
+                    );
+
+            image.close();
+            image = null;
+
+            BoardDetector.Board detected =
+                    BoardDetector.locate(
+                            bitmap
+                    );
+
+            if (detected == null) {
+
+                resetPendingMove();
+
+                lostBoardCount++;
+
+                if (lostBoardCount
+                        >= LOST_BOARD_THRESHOLD) {
+
+                    panelStatus(
+                            "Brett nicht erkannt"
+                    );
+
+                    clearArrows();
+                }
 
                 return;
             }
 
-            board = lockedBoard;
-        }
+            lostBoardCount = 0;
 
-        overlayBounds = canMapToScreen()
-                ? boardBoundsOnScreen(board)
-                : null;
+            BoardDetector.Board board =
+                    detected;
 
-        if (!classifier.isTrained()) {
-            calibrate(bitmap, board);
-            return;
-        }
+            if (classifier.isTrained()
+                    && lockedBoard != null) {
 
-        char[][] observed =
-                classifier.classifyBoard(bitmap, board);
+                if (boardMovedTooFar(
+                        lockedBoard,
+                        detected
+                )) {
 
-        if (!isGridValid(observed)) {
-            candidate.reset();
-            statusText = "Figuren nicht eindeutig erkannt";
-            frameColor = COLOR_WAITING;
-            return;
-        }
+                    resetPendingMove();
 
-        if (!isGridValid(confirmedGrid)) {
-            resetCalibration(
-                    "Stellung zurückgesetzt – Startstellung zeigen"
-            );
-            return;
-        }
+                    clearArrows();
 
-        if (gridsEqual(observed, confirmedGrid)) {
-            candidate.reset();
-            frameColor = COLOR_READY;
+                    panelStatus(
+                            "Brett verschoben · neu kalibrieren"
+                    );
 
-            statusText = lastMoveText.isEmpty()
-                    ? "Warte auf Zug"
-                    : "ERKANNT: " + lastMoveText;
+                    panelEval("");
 
-            evalText = confirmedEvalText;
-            return;
-        }
+                    return;
+                }
 
-        if (!candidate.observe(observed, now)) {
-            statusText = "Bildänderung erkannt – bestätige…";
-            frameColor = COLOR_WAITING;
-            return;
-        }
+                board =
+                        lockedBoard;
+            }
 
-        /*
-         * Zuerst einen einzelnen Zug prüfen.
-         * Der bestätigte Zustand wird nur als Kopie übergeben.
-         */
-        char[][] proposal = copyGrid(observed);
-
-        MoveAnalyzer.Result move = MoveAnalyzer.analyze(
-                copyGrid(confirmedGrid),
-                proposal
-        );
-
-        if (validMoveResult(move, confirmedGrid, proposal)
-                && gridsEqual(proposal, observed)) {
-
-            acceptMoves(
-                    new MoveSnapshot(move),
-                    null,
-                    proposal,
-                    observed,
-                    bitmap,
-                    board
+            setBoardBounds(
+                    boardBoundsOnScreen(
+                            board
+                    )
             );
 
-            return;
-        }
+            /*
+             * KALIBRIERUNG
+             */
+            if (!classifier.isTrained()) {
 
-        /*
-         * Zwei aufeinanderfolgende Züge prüfen.
-         *
-         * Beispiel:
-         * Startstellung -> d2-d4 -> d7-d5
-         *
-         * Beide Übergänge müssen vom Analyzer bestätigt werden.
-         * Die Endstellung muss exakt zum beobachteten Raster passen.
-         */
-        MovePair pair = recoverTwoMoves(
-                confirmedGrid,
-                observed,
-                expectedSide
-        );
+                calibrate(
+                        bitmap,
+                        board
+                );
 
-        if (pair != null) {
-            acceptMoves(
-                    pair.first,
-                    pair.second,
+                return;
+            }
+
+            char[][] observed =
+                    classifier.classifyBoard(
+                            bitmap,
+                            board
+                    );
+
+            if (!validGrid(observed)
+                    || !validGrid(
+                    confirmedGrid
+            )) {
+
+                resetPendingMove();
+
+                panelStatus(
+                        "Figuren nicht eindeutig erkannt"
+                );
+
+                return;
+            }
+
+            /*
+             * Keine Änderung.
+             */
+            if (gridsEqual(
                     observed,
-                    observed,
-                    bitmap,
-                    board
-            );
+                    confirmedGrid
+            )) {
 
-            return;
-        }
+                resetPendingMove();
 
-        /*
-         * Erneut auswerten, weil der Analyzer Result-Objekte
-         * intern möglicherweise wiederverwendet.
-         */
-        proposal = copyGrid(observed);
+                /*
+                 * Falls aus irgendeinem Grund noch kein
+                 * Stockfish-Ergebnis für die aktuelle
+                 * bestätigte Stellung vorhanden ist.
+                 */
+                if (expectedSide == userSide
+                        && engineReady
+                        && lastEngineFen.isEmpty()) {
 
-        move = MoveAnalyzer.analyze(
-                copyGrid(confirmedGrid),
-                proposal
-        );
+                    queryEngineAndRender(
+                            board
+                    );
 
-        /*
-         * Kleine Bildfehler darf der Analyzer wie bisher reparieren.
-         * Bei vier oder mehr Änderungen keine unklare Mehrzugfolge
-         * durch eine reparierte Einzelstellung ersetzen.
-         */
-        if (validMoveResult(move, confirmedGrid, proposal)
-                && countChanges(confirmedGrid, observed) < 4) {
+                    return;
+                }
 
-            acceptMoves(
-                    new MoveSnapshot(move),
-                    null,
-                    proposal,
-                    observed,
-                    bitmap,
-                    board
-            );
+                if (expectedSide != userSide) {
 
-            return;
-        }
+                    clearArrows();
 
-        statusText = "NICHT SICHER";
-        frameColor = COLOR_WAITING;
+                    panelStatus(
+                            "Gegner am Zug"
+                    );
 
-        evalText =
-                "ÄNDERUNGEN: "
-                        + countChanges(confirmedGrid, observed)
-                        + " | ERWARTET: "
-                        + sideGerman(expectedSide)
-                        + "\nANALYSE: "
-                        + (move == null
-                        ? "kein Ergebnis"
-                        : String.valueOf(move.kind))
-                        + " | SCORE: "
-                        + scoreText(move)
-                        + "\nGRUND: "
-                        + rejectionReason(
-                                move,
+                    panelEval(
+                            lastMoveText.isEmpty()
+                                    ? "Warte auf Gegenzug"
+                                    : "LETZTER ZUG: "
+                                    + lastMoveText
+                                    + "\nWarte auf Gegenzug"
+                    );
+                }
+
+                return;
+            }
+
+            /*
+             * Analyzer arbeitet auf Kopien.
+             *
+             * Bei erfolgreicher Erkennung wird proposal
+             * zur sauberen Folgestellung umgebaut.
+             */
+            char[][] proposal =
+                    copyGrid(
+                            observed
+                    );
+
+            MoveAnalyzer.Result move =
+                    MoveAnalyzer.analyze(
+                            copyGrid(
+                                    confirmedGrid
+                            ),
+                            proposal
+                    );
+
+            if (!usableMove(move)) {
+
+                resetPendingMove();
+
+                clearArrows();
+
+                lastEngineFen = "";
+
+                panelStatus(
+                        "Position nicht sicher"
+                );
+
+                panelEval(
+                        "ÄNDERUNGEN: "
+                                + countChanges(
                                 confirmedGrid,
-                                proposal
-                        );
+                                observed
+                        )
+                                + "\nERWARTET: "
+                                + sideGerman(
+                                expectedSide
+                        )
+                );
 
-    } finally {
-        if (bitmap != null && !bitmap.isRecycled()) {
-            bitmap.recycle();
+                return;
+            }
+
+            /*
+             * Nur derselbe Zug muss zweimal erkannt werden.
+             */
+            String moveKey =
+                    move.mover
+                            + ":"
+                            + move.fromRow
+                            + ","
+                            + move.fromFile
+                            + ">"
+                            + move.toRow
+                            + ","
+                            + move.toFile
+                            + ":"
+                            + move.kind;
+
+            long now =
+                    SystemClock.uptimeMillis();
+
+            if (!moveKey.equals(
+                    pendingMoveKey
+            )
+                    || now - pendingMoveAt
+                    > MAX_CONFIRM_GAP_MS) {
+
+                pendingMoveKey =
+                        moveKey;
+
+                pendingMoveCount =
+                        1;
+
+                pendingMoveAt =
+                        now;
+
+                panelStatus(
+                        "Zug erkannt · bestätige…"
+                );
+
+                panelEval(
+                        sideGerman(
+                                move.mover
+                        )
+                                + " "
+                                + squareName(
+                                move.fromRow,
+                                move.fromFile
+                        )
+                                + " → "
+                                + squareName(
+                                move.toRow,
+                                move.toFile
+                        )
+                );
+
+                return;
+            }
+
+            pendingMoveCount++;
+
+            pendingMoveAt =
+                    now;
+
+            if (pendingMoveCount
+                    < REQUIRED_CONFIRMATIONS) {
+
+                return;
+            }
+
+            /*
+             * ZUG BESTÄTIGT
+             */
+            boolean syncCorrected =
+                    move.mover
+                            != expectedSide;
+
+            String from =
+                    squareName(
+                            move.fromRow,
+                            move.fromFile
+                    );
+
+            String to =
+                    squareName(
+                            move.toRow,
+                            move.toFile
+                    );
+
+            String mover =
+                    sideGerman(
+                            move.mover
+                    );
+
+            confirmedGrid =
+                    copyGrid(
+                            proposal
+                    );
+
+            /*
+             * Erst nach einem bestätigten Zug wird
+             * der Klassifikator fortgeschrieben.
+             */
+            classifier.commitConfirmed(
+                    confirmedGrid,
+                    bitmap,
+                    board
+            );
+
+            expectedSide =
+                    opposite(
+                            move.mover
+                    );
+
+            lastMoveText =
+                    mover
+                            + " "
+                            + from
+                            + "→"
+                            + to;
+
+            lastEngineFen = "";
+
+            resetPendingMove();
+
+            int confidence =
+                    (int) Math.round(
+                            Math.max(
+                                    0.0,
+                                    Math.min(
+                                            1.0,
+                                            move.confidence
+                                    )
+                            ) * 100.0
+                    );
+
+            Log.i(
+                    TAG,
+                    "MOVE "
+                            + lastMoveText
+                            + " next="
+                            + expectedSide
+                            + " confidence="
+                            + confidence
+                            + " sync="
+                            + syncCorrected
+            );
+
+            if (expectedSide
+                    == userSide) {
+
+                panelStatus(
+                        syncCorrected
+                                ? "SYNC KORRIGIERT · Stockfish rechnet…"
+                                : "Zug erkannt · Stockfish rechnet…"
+                );
+
+                queryEngineAndRender(
+                        board
+                );
+
+            } else {
+
+                clearArrows();
+
+                panelStatus(
+                        syncCorrected
+                                ? "SYNC KORRIGIERT · Gegner am Zug"
+                                : "Gegner am Zug"
+                );
+
+                panelEval(
+                        "ERKANNT: "
+                                + lastMoveText
+                                + "\nDANACH: "
+                                + sideGerman(
+                                expectedSide
+                        )
+                                + " am Zug"
+                                + "\nSICHER: "
+                                + confidence
+                                + "%"
+                );
+            }
+
+        } catch (Exception e) {
+
+            Log.e(
+                    TAG,
+                    "sampleOnce failed",
+                    e
+            );
+
+            panelStatus(
+                    "Fehler bei Zugerkennung"
+            );
+
+        } finally {
+
+            if (bitmap != null
+                    && !bitmap.isRecycled()) {
+
+                bitmap.recycle();
+            }
+
+            if (image != null) {
+
+                try {
+
+                    image.close();
+
+                } catch (Exception ignored) {
+                }
+            }
+
+            busy = false;
         }
     }
-}
 
+    private void calibrate(
+            Bitmap bitmap,
+            BoardDetector.Board board
+    ) {
 
-private void acceptMoves(
-        MoveSnapshot first,
-        @Nullable MoveSnapshot second,
-        char[][] after,
-        char[][] observed,
-        Bitmap bitmap,
-        BoardDetector.Board board
-) throws Exception {
-    if (stopping) {
-        return;
+        boolean ok =
+                classifier.tryBootstrap(
+                        bitmap,
+                        board
+                );
+
+        if (!ok) {
+
+            panelStatus(
+                    "Startstellung zeigen"
+            );
+
+            setFrameColor(
+                    0x66FFB300
+            );
+
+            return;
+        }
+
+        Side detectedSide =
+                classifier.bootstrapSide();
+
+        if (detectedSide
+                != userSide) {
+
+            classifier.reset();
+
+            panelStatus(
+                    "Brett/Farbe stimmt nicht"
+            );
+
+            panelEval(
+                    "Farbe wählen oder Brett drehen"
+            );
+
+            setFrameColor(
+                    0x66D32F2F
+            );
+
+            return;
+        }
+
+        lockedBoard =
+                board;
+
+        confirmedGrid =
+                startingGridFor(
+                        userSide
+                );
+
+        expectedSide =
+                Side.WHITE;
+
+        lastMoveText = "";
+
+        lastEngineFen = "";
+
+        resetPendingMove();
+
+        setFrameColor(
+                0x6600C853
+        );
+
+        if (!engineReady) {
+
+            panelStatus(
+                    "Kalibriert · Stockfish startet"
+            );
+
+            return;
+        }
+
+        if (expectedSide
+                == userSide) {
+
+            queryEngineAndRender(
+                    board
+            );
+
+        } else {
+
+            clearArrows();
+
+            panelStatus(
+                    "Kalibriert · Gegner am Zug"
+            );
+
+            panelEval(
+                    "Warte auf Gegenzug"
+            );
+        }
     }
-
-    int changes = countChanges(confirmedGrid, observed);
-
-    boolean recoveredSync =
-            second != null || first.mover != expectedSide;
 
     /*
-     * Nur exakt passende Bilddaten zum Nachtrainieren verwenden.
+     * ---------------------------------------------------------
+     * STOCKFISH
+     * ---------------------------------------------------------
      */
-    if (gridsEqual(after, observed)) {
-        try {
-            classifier.commitConfirmed(
-                    copyGrid(after),
-                    bitmap,
-                    board
-            );
 
-        } catch (Exception error) {
-            resetCalibration(
-                    "Kalibrierung fehlgeschlagen – Startstellung zeigen"
-            );
-            throw error;
-        }
-    }
+    private void queryEngineAndRender(
+            BoardDetector.Board board
+    ) {
 
-    confirmedGrid = copyGrid(after);
+        if (!engineReady
+                || engine == null
+                || confirmedGrid == null
+                || classifier.bootstrapSide() == null) {
 
-    expectedSide = opposite(
-            second == null ? first.mover : second.mover
-    );
-
-    candidate.reset();
-    frameColor = COLOR_READY;
-
-    String firstText = describeMove(first);
-
-    if (second == null) {
-        lastMoveText = firstText;
-
-        statusText = recoveredSync
-                ? "SYNC KORRIGIERT: " + firstText
-                : "ERKANNT: " + firstText;
-
-        evalText =
-                "ERKANNT: "
-                        + firstText
-                        + "\nDANACH: "
-                        + sideGerman(expectedSide)
-                        + " am Zug"
-                        + "\nÄNDERUNGEN: "
-                        + changes
-                        + " | SCORE: "
-                        + Math.round(first.confidence * 100)
-                        + "%"
-                        + "\nART: "
-                        + kindGerman(first.kind);
-
-    } else {
-        String secondText = describeMove(second);
-
-        lastMoveText =
-                firstText
-                        + " | "
-                        + secondText
-                        + " (rekonstruiert)";
-
-        statusText = "2 ZÜGE REKONSTRUIERT";
-
-        evalText =
-                firstText
-                        + "\n"
-                        + secondText
-                        + "\nDANACH: "
-                        + sideGerman(expectedSide)
-                        + " am Zug"
-                        + "\nSCORES: "
-                        + Math.round(first.confidence * 100)
-                        + "% / "
-                        + Math.round(second.confidence * 100)
-                        + "%";
-    }
-
-    confirmedEvalText = evalText;
-
-    Log.i(
-            TAG,
-            "MOVE "
-                    + lastMoveText
-                    + " syncRecovered="
-                    + recoveredSync
-    );
-}
-
-
-private String describeMove(MoveSnapshot move) {
-    return sideGerman(move.mover)
-            + " "
-            + squareNameFor(
-                    move.fromRow,
-                    move.fromFile,
-                    boardPerspective
-            )
-            + "→"
-            + squareNameFor(
-                    move.toRow,
-                    move.toFile,
-                    boardPerspective
-            );
-}
-
-
-/*
- * Begrenzte Wiederherstellung zweier aufeinanderfolgender Züge.
- *
- * Die Reihenfolge folgt expectedSide. Sie wird rekonstruiert,
- * nicht aus einem tatsächlich beobachteten Zwischenbild gelesen.
- *
- * Es werden ausschließlich eindeutig aufteilbare Änderungen geprüft.
- * Beide Einzelzüge müssen vom vorhandenen MoveAnalyzer bestätigt
- * werden und die beobachtete Endstellung exakt ergeben.
- *
- * Überlappende Züge, mehr als sechs geänderte Felder und mehrere
- * mögliche Zwischenstellungen werden nicht geraten.
- *
- * Die vollständige Schach-Legalitätsprüfung bleibt Aufgabe
- * von MoveAnalyzer.
- */
-private static MovePair recoverTwoMoves(
-        char[][] before,
-        char[][] observed,
-        Side firstSide
-) throws Exception {
-    if (!isGridValid(before)
-            || !isGridValid(observed)
-            || !hasBothKings(before)
-            || !hasBothKings(observed)
-            || (firstSide != Side.WHITE
-            && firstSide != Side.BLACK)) {
-        return null;
-    }
-
-    int changes = countChanges(before, observed);
-
-    if (changes < 4 || changes > 6) {
-        return null;
-    }
-
-    int[] squares = new int[changes];
-    int index = 0;
-
-    for (int row = 0; row < 8; row++) {
-        for (int file = 0; file < 8; file++) {
-            if (before[row][file] != observed[row][file]) {
-                squares[index++] = row * 8 + file;
-            }
-        }
-    }
-
-    MovePair found = null;
-
-    for (int mask = 1; mask < (1 << changes) - 1; mask++) {
-        int firstChanges = Integer.bitCount(mask);
-        int secondChanges = changes - firstChanges;
-
-        if (firstChanges < 2
-                || firstChanges > 4
-                || secondChanges < 2
-                || secondChanges > 4) {
-            continue;
-        }
-
-        char[][] middle = copyGrid(before);
-
-        boolean departure = false;
-        boolean arrival = false;
-
-        for (int bit = 0; bit < changes; bit++) {
-            if ((mask & (1 << bit)) == 0) {
-                continue;
-            }
-
-            int row = squares[bit] / 8;
-            int file = squares[bit] % 8;
-
-            middle[row][file] = observed[row][file];
-
-            departure |=
-                    belongsTo(before[row][file], firstSide)
-                            && middle[row][file] == '.';
-
-            arrival |=
-                    belongsTo(middle[row][file], firstSide);
-        }
-
-        if (!departure
-                || !arrival
-                || !hasBothKings(middle)) {
-            continue;
-        }
-
-        char[][] firstAfter = copyGrid(middle);
-
-        MoveAnalyzer.Result firstResult =
-                MoveAnalyzer.analyze(
-                        copyGrid(before),
-                        firstAfter
-                );
-
-        if (!validMoveResult(firstResult, before, firstAfter)
-                || firstResult.mover != firstSide
-                || !gridsEqual(firstAfter, middle)) {
-            continue;
+            return;
         }
 
         /*
-         * Werte kopieren, bevor der Analyzer erneut aufgerufen wird.
+         * Nur für die gewählte Testseite
+         * eine Empfehlung anzeigen.
          */
-        MoveSnapshot first = new MoveSnapshot(firstResult);
+        if (expectedSide
+                != userSide) {
 
-        char[][] secondAfter = copyGrid(observed);
+            clearArrows();
 
-        MoveAnalyzer.Result secondResult =
-                MoveAnalyzer.analyze(
-                        copyGrid(middle),
-                        secondAfter
-                );
-
-        if (!validMoveResult(secondResult, middle, secondAfter)
-                || secondResult.mover != opposite(firstSide)
-                || !gridsEqual(secondAfter, observed)) {
-            continue;
+            return;
         }
 
-        if (found != null) {
-            /*
-             * Mehrere mögliche Verläufe:
-             * Die bisher bestätigte Stellung behalten.
-             */
+        String fen =
+                FenBuilder.build(
+                        confirmedGrid,
+                        classifier.bootstrapSide(),
+                        expectedSide
+                );
+
+        if (fen == null) {
+
+            clearArrows();
+
+            panelStatus(
+                    "Interne Stellung ungültig"
+            );
+
+            panelEval("");
+
+            return;
+        }
+
+        if (fen.equals(
+                lastEngineFen
+        )
+                && !currentArrows.isEmpty()) {
+
+            pushCurrentArrows(
+                    board
+            );
+
+            return;
+        }
+
+        panelStatus(
+                "Stockfish rechnet…"
+        );
+
+        try {
+
+            int thinkMs =
+                    Prefs.thinkMs(
+                            getApplicationContext()
+                    );
+
+            List<StockfishEngine.Pv> moves =
+                    engine.topMoves(
+                            fen,
+                            thinkMs,
+                            1
+                    );
+
+            if (moves == null
+                    || moves.isEmpty()) {
+
+                clearArrows();
+
+                panelStatus(
+                        "Kein Stockfish-Zug"
+                );
+
+                panelEval("");
+
+                return;
+            }
+
+            StockfishEngine.Pv best =
+                    moves.get(0);
+
+            if (best.uci == null
+                    || best.uci.length() < 4) {
+
+                clearArrows();
+
+                panelStatus(
+                        "Stockfish-Antwort ungültig"
+                );
+
+                return;
+            }
+
+            ArrowOverlayView.Arrow arrow =
+                    arrowForUci(
+                            best.uci,
+                            board
+                    );
+
+            if (arrow == null) {
+
+                clearArrows();
+
+                panelStatus(
+                        "Zug konnte nicht gezeichnet werden"
+                );
+
+                return;
+            }
+
+            currentArrows.clear();
+
+            currentArrows.add(
+                    arrow
+            );
+
+            lastEngineFen =
+                    fen;
+
+            pushCurrentArrows(
+                    board
+            );
+
+            String bestText =
+                    formatUci(
+                            best.uci
+                    );
+
+            panelStatus(
+                    "Bereit"
+            );
+
+            String info =
+                    "BESTER ZUG: "
+                            + bestText
+                            + "\nINTERN: "
+                            + sideGerman(
+                            expectedSide
+                    )
+                            + " am Zug";
+
+            if (!lastMoveText.isEmpty()) {
+
+                info +=
+                        "\nLETZTER ZUG: "
+                                + lastMoveText;
+            }
+
+            panelEval(
+                    info
+            );
+
+        } catch (Exception e) {
+
+            Log.e(
+                    TAG,
+                    "Stockfish query failed",
+                    e
+            );
+
+            clearArrows();
+
+            lastEngineFen = "";
+
+            panelStatus(
+                    "Stockfish-Fehler"
+            );
+
+            panelEval(
+                    "Engine-Abfrage fehlgeschlagen"
+            );
+        }
+    }
+
+    private ArrowOverlayView.Arrow arrowForUci(
+            String uci,
+            BoardDetector.Board board
+    ) {
+
+        if (uci == null
+                || uci.length() < 4) {
+
             return null;
         }
 
-        found = new MovePair(
-                first,
-                new MoveSnapshot(secondResult)
+        int fromFile =
+                uci.charAt(0) - 'a';
+
+        int fromRank =
+                uci.charAt(1) - '0';
+
+        int toFile =
+                uci.charAt(2) - 'a';
+
+        int toRank =
+                uci.charAt(3) - '0';
+
+        if (fromFile < 0
+                || fromFile > 7
+                || toFile < 0
+                || toFile > 7
+                || fromRank < 1
+                || fromRank > 8
+                || toRank < 1
+                || toRank > 8) {
+
+            return null;
+        }
+
+        int fromRow =
+                8 - fromRank;
+
+        int toRow =
+                8 - toRank;
+
+        int screenFromRow =
+                fromRow;
+
+        int screenFromFile =
+                fromFile;
+
+        int screenToRow =
+                toRow;
+
+        int screenToFile =
+                toFile;
+
+        if (classifier.bootstrapSide()
+                == Side.BLACK) {
+
+            screenFromRow =
+                    7 - fromRow;
+
+            screenFromFile =
+                    7 - fromFile;
+
+            screenToRow =
+                    7 - toRow;
+
+            screenToFile =
+                    7 - toFile;
+        }
+
+        Rect bounds =
+                boardBoundsOnScreen(
+                        board
+                );
+
+        float square =
+                bounds.width()
+                        / 8f;
+
+        float sx =
+                bounds.left
+                        + (
+                        screenFromFile
+                                + 0.5f
+                ) * square;
+
+        float sy =
+                bounds.top
+                        + (
+                        screenFromRow
+                                + 0.5f
+                ) * square;
+
+        float ex =
+                bounds.left
+                        + (
+                        screenToFile
+                                + 0.5f
+                ) * square;
+
+        float ey =
+                bounds.top
+                        + (
+                        screenToRow
+                                + 0.5f
+                ) * square;
+
+        return new ArrowOverlayView.Arrow(
+                sx,
+                sy,
+                ex,
+                ey,
+                BEST_ARROW_COLOR,
+                BEST_ARROW_WIDTH,
+                null
         );
     }
 
-    return found;
-}
+    private String formatUci(
+            String uci
+    ) {
 
+        if (uci == null
+                || uci.length() < 4) {
 
-private static final class MoveSnapshot {
+            return "?";
+        }
 
-    final MoveAnalyzer.Kind kind;
-    final Side mover;
+        String text =
+                uci.substring(
+                        0,
+                        2
+                )
+                        + " → "
+                        + uci.substring(
+                        2,
+                        4
+                );
 
-    final int fromRow;
-    final int fromFile;
-    final int toRow;
-    final int toFile;
+        if (uci.length() >= 5) {
 
-    final double confidence;
+            char promotion =
+                    Character.toUpperCase(
+                            uci.charAt(4)
+                    );
 
-    MoveSnapshot(MoveAnalyzer.Result result) {
-        kind = result.kind;
-        mover = result.mover;
+            text +=
+                    "="
+                            + promotion;
+        }
 
-        fromRow = result.fromRow;
-        fromFile = result.fromFile;
-        toRow = result.toRow;
-        toFile = result.toFile;
-
-        confidence = result.confidence;
-    }
-}
-
-
-private static final class MovePair {
-
-    final MoveSnapshot first;
-    final MoveSnapshot second;
-
-    MovePair(MoveSnapshot first, MoveSnapshot second) {
-        this.first = first;
-        this.second = second;
-    }
-}
-
-
-private static String scoreText(
-        @Nullable MoveAnalyzer.Result move
-) {
-    if (move == null || !finite(move.confidence)) {
-        return "ungültig";
+        return text;
     }
 
-    return Math.round(move.confidence * 100) + "%";
-}
+    private void pushCurrentArrows(
+            BoardDetector.Board board
+    ) {
 
+        if (main == null) {
+            return;
+        }
 
-private static String rejectionReason(
-        @Nullable MoveAnalyzer.Result move,
-        char[][] before,
-        char[][] after
-) {
-    if (move == null) {
-        return "Analyzer liefert kein Ergebnis";
+        final Rect bounds =
+                boardBoundsOnScreen(
+                        board
+                );
+
+        final List<ArrowOverlayView.Arrow> copy =
+                new ArrayList<>(
+                        currentArrows
+                );
+
+        main.post(
+                () ->
+                        OverlayService.pushArrows(
+                                copy,
+                                bounds
+                        )
+        );
     }
 
-    if (move.kind == null
-            || move.kind == MoveAnalyzer.Kind.UNKNOWN) {
-        return "Kein eindeutiger Verlauf erkannt";
+    private void clearArrows() {
+
+        currentArrows.clear();
+
+        if (main != null) {
+
+            main.post(
+                    OverlayService::clearArrowsOnly
+            );
+        }
     }
 
-    if (move.kind == MoveAnalyzer.Kind.NONE) {
-        return "Analyzer meldet keinen Zug";
+    private void clearAll() {
+
+        currentArrows.clear();
+
+        if (main != null) {
+
+            main.post(
+                    OverlayService::clearAll
+            );
+        }
     }
 
-    if (!finite(move.confidence)
-            || move.confidence < MIN_MOVE_CONFIDENCE
-            || move.confidence > 1.0) {
-        return "Ungültiger oder zu kleiner Score";
+    /*
+     * ---------------------------------------------------------
+     * ZUG-/BRETT-HILFEN
+     * ---------------------------------------------------------
+     */
+
+    private boolean usableMove(
+            MoveAnalyzer.Result move
+    ) {
+
+        if (move == null
+                || move.kind
+                == MoveAnalyzer.Kind.UNKNOWN
+                || move.kind
+                == MoveAnalyzer.Kind.NONE
+                || move.mover == null) {
+
+            return false;
+        }
+
+        return move.fromRow >= 0
+                && move.fromRow < 8
+                && move.fromFile >= 0
+                && move.fromFile < 8
+                && move.toRow >= 0
+                && move.toRow < 8
+                && move.toFile >= 0
+                && move.toFile < 8
+                && move.confidence > 0.0;
     }
 
-    if (!isGridValid(before) || !isGridValid(after)) {
-        return "Ungültiges Figurenraster";
+    private String squareName(
+            int row,
+            int file
+    ) {
+
+        if (classifier == null
+                || classifier.bootstrapSide()
+                == null) {
+
+            return "?";
+        }
+
+        int r =
+                row;
+
+        int f =
+                file;
+
+        if (classifier.bootstrapSide()
+                == Side.BLACK) {
+
+            r =
+                    7 - r;
+
+            f =
+                    7 - f;
+        }
+
+        char fileChar =
+                (char) (
+                        'a' + f
+                );
+
+        int rank =
+                8 - r;
+
+        return ""
+                + fileChar
+                + rank;
     }
 
-    if (!hasBothKings(before) || !hasBothKings(after)) {
-        return "Könige nicht eindeutig erkannt";
+    private String sideGerman(
+            Side side
+    ) {
+
+        if (side == Side.WHITE) {
+            return "Weiß";
+        }
+
+        if (side == Side.BLACK) {
+            return "Schwarz";
+        }
+
+        return "?";
     }
 
-    if (move.mover != Side.WHITE && move.mover != Side.BLACK) {
-        return "Zugfarbe fehlt";
+    private Side opposite(
+            Side side
+    ) {
+
+        return side == Side.WHITE
+                ? Side.BLACK
+                : Side.WHITE;
     }
 
-    if (!validSquare(move.fromRow, move.fromFile)
-            || !validSquare(move.toRow, move.toFile)) {
-        return "Ungültige Zugkoordinaten";
+    private int countChanges(
+            char[][] a,
+            char[][] b
+    ) {
+
+        if (!validGrid(a)
+                || !validGrid(b)) {
+
+            return 64;
+        }
+
+        int count =
+                0;
+
+        for (int r = 0;
+             r < 8;
+             r++) {
+
+            for (int f = 0;
+                 f < 8;
+                 f++) {
+
+                if (normalize(
+                        a[r][f]
+                )
+                        != normalize(
+                        b[r][f]
+                )) {
+
+                    count++;
+                }
+            }
+        }
+
+        return count;
     }
 
-    return "Zug passt nicht zur erkannten Stellung";
+    private char normalize(
+            char c
+    ) {
+
+        return c == 0
+                ? '.'
+                : c;
+    }
+
+    private boolean validGrid(
+            char[][] grid
+    ) {
+
+        if (grid == null
+                || grid.length != 8) {
+
+            return false;
+        }
+
+        for (int r = 0;
+             r < 8;
+             r++) {
+
+            if (grid[r] == null
+                    || grid[r].length != 8) {
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean gridsEqual(
+            char[][] a,
+            char[][] b
+    ) {
+
+        if (!validGrid(a)
+                || !validGrid(b)) {
+
+            return false;
+        }
+
+        for (int r = 0;
+             r < 8;
+             r++) {
+
+            if (!Arrays.equals(
+                    a[r],
+                    b[r]
+            )) {
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private char[][] copyGrid(
+            char[][] source
+    ) {
+
+        if (!validGrid(source)) {
+            return null;
+        }
+
+        char[][] copy =
+                new char[8][8];
+
+        for (int r = 0;
+             r < 8;
+             r++) {
+
+            System.arraycopy(
+                    source[r],
+                    0,
+                    copy[r],
+                    0,
+                    8
+            );
+        }
+
+        return copy;
+    }
+
+    private char[][] startingGridFor(
+            Side perspective
+    ) {
+
+        char[][] base = {
+
+                {
+                        'r','n','b','q',
+                        'k','b','n','r'
+                },
+
+                {
+                        'p','p','p','p',
+                        'p','p','p','p'
+                },
+
+                {
+                        '.','.','.','.',
+                        '.','.','.','.'
+                },
+
+                {
+                        '.','.','.','.',
+                        '.','.','.','.'
+                },
+
+                {
+                        '.','.','.','.',
+                        '.','.','.','.'
+                },
+
+                {
+                        '.','.','.','.',
+                        '.','.','.','.'
+                },
+
+                {
+                        'P','P','P','P',
+                        'P','P','P','P'
+                },
+
+                {
+                        'R','N','B','Q',
+                        'K','B','N','R'
+                }
+        };
+
+        if (perspective
+                == Side.WHITE) {
+
+            return base;
+        }
+
+        char[][] flipped =
+                new char[8][8];
+
+        for (int r = 0;
+             r < 8;
+             r++) {
+
+            for (int f = 0;
+                 f < 8;
+                 f++) {
+
+                flipped[r][f] =
+                        base[
+                                7 - r
+                        ][
+                                7 - f
+                        ];
+            }
+        }
+
+        return flipped;
+    }
+
+    private boolean boardMovedTooFar(
+            BoardDetector.Board locked,
+            BoardDetector.Board detected
+    ) {
+
+        float tolerance =
+                Math.max(
+                        6f,
+                        locked.square
+                                * 0.40f
+                );
+
+        return Math.abs(
+                locked.left
+                        - detected.left
+        ) > tolerance
+                || Math.abs(
+                locked.top
+                        - detected.top
+        ) > tolerance
+                || Math.abs(
+                locked.side
+                        - detected.side
+        ) > tolerance * 2f;
+    }
+
+    private Rect boardBoundsOnScreen(
+            BoardDetector.Board board
+    ) {
+
+        return new Rect(
+
+                Math.round(
+                        board.left
+                                * capToScreenX
+                ),
+
+                Math.round(
+                        board.top
+                                * capToScreenY
+                ),
+
+                Math.round(
+                        (
+                                board.left
+                                        + board.side
+                        )
+                                * capToScreenX
+                ),
+
+                Math.round(
+                        (
+                                board.top
+                                        + board.side
+                        )
+                                * capToScreenY
+                )
+        );
+    }
+
+    /*
+     * ---------------------------------------------------------
+     * OVERLAY / PANEL
+     * ---------------------------------------------------------
+     */
+
+    private void setBoardBounds(
+            Rect bounds
+    ) {
+
+        if (main != null) {
+
+            main.post(
+                    () ->
+                            OverlayService.setBoardBounds(
+                                    bounds
+                            )
+            );
+        }
+    }
+
+    private void setFrameColor(
+            int color
+    ) {
+
+        if (main != null) {
+
+            main.post(
+                    () ->
+                            OverlayService
+                                    .setBoardFrameColor(
+                                            color
+                                    )
+            );
+        }
+    }
+
+    private void panelStatus(
+            String text
+    ) {
+
+        Runnable action =
+                () -> {
+
+                    FloatingPanel panel =
+                            OverlayService.panel();
+
+                    if (panel != null) {
+                        panel.setStatus(text);
+                    }
+                };
+
+        if (main != null) {
+            main.post(action);
+        }
+    }
+
+    private void panelEval(
+            String text
+    ) {
+
+        Runnable action =
+                () -> {
+
+                    FloatingPanel panel =
+                            OverlayService.panel();
+
+                    if (panel != null) {
+                        panel.setEval(text);
+                    }
+                };
+
+        if (main != null) {
+            main.post(action);
+        }
+    }
+
+    /*
+     * ---------------------------------------------------------
+     * SCREEN CAPTURE
+     * ---------------------------------------------------------
+     */
+
+    @SuppressWarnings("deprecation")
+    private void setupVirtualDisplay() {
+
+        DisplayMetrics metrics =
+                new DisplayMetrics();
+
+        WindowManager windowManager =
+                (WindowManager)
+                        getSystemService(
+                                WINDOW_SERVICE
+                        );
+
+        windowManager
+                .getDefaultDisplay()
+                .getRealMetrics(
+                        metrics
+                );
+
+        screenW =
+                metrics.widthPixels;
+
+        screenH =
+                metrics.heightPixels;
+
+        density =
+                metrics.densityDpi;
+
+        float maxEdge =
+                Math.max(
+                        screenW,
+                        screenH
+                );
+
+        float scale =
+                Math.min(
+                        1f,
+                        800f / maxEdge
+                );
+
+        captureW =
+                Math.max(
+                        1,
+                        Math.round(
+                                screenW * scale
+                        )
+                );
+
+        captureH =
+                Math.max(
+                        1,
+                        Math.round(
+                                screenH * scale
+                        )
+                );
+
+        capToScreenX =
+                (float) screenW
+                        / captureW;
+
+        capToScreenY =
+                (float) screenH
+                        / captureH;
+
+        reader =
+                ImageReader.newInstance(
+                        captureW,
+                        captureH,
+                        PixelFormat.RGBA_8888,
+                        4
+                );
+
+        virtualDisplay =
+                projection.createVirtualDisplay(
+                        "OpenCheps",
+                        captureW,
+                        captureH,
+                        density,
+                        DisplayManager
+                                .VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                        reader.getSurface(),
+                        null,
+                        worker
+                );
+    }
+
+    private Bitmap imageToBitmap(
+            Image image
+    ) {
+
+        Image.Plane plane =
+                image.getPlanes()[0];
+
+        ByteBuffer buffer =
+                plane.getBuffer();
+
+        int width =
+                image.getWidth();
+
+        int height =
+                image.getHeight();
+
+        int pixelStride =
+                plane.getPixelStride();
+
+        int rowStride =
+                plane.getRowStride();
+
+        int rowPadding =
+                rowStride
+                        - pixelStride
+                        * width;
+
+        int bitmapWidth =
+                width
+                        + rowPadding
+                        / pixelStride;
+
+        Bitmap raw =
+                Bitmap.createBitmap(
+                        bitmapWidth,
+                        height,
+                        Bitmap.Config.ARGB_8888
+                );
+
+        buffer.rewind();
+
+        raw.copyPixelsFromBuffer(
+                buffer
+        );
+
+        if (bitmapWidth == width) {
+            return raw;
+        }
+
+        Bitmap cropped =
+                Bitmap.createBitmap(
+                        raw,
+                        0,
+                        0,
+                        width,
+                        height
+                );
+
+        raw.recycle();
+
+        return cropped;
+    }
+
+    /*
+     * ---------------------------------------------------------
+     * FOREGROUND SERVICE
+     * ---------------------------------------------------------
+     */
+
+    private void startInForeground() {
+
+        NotificationManager manager =
+                (NotificationManager)
+                        getSystemService(
+                                NOTIFICATION_SERVICE
+                        );
+
+        if (Build.VERSION.SDK_INT
+                >= 26) {
+
+            NotificationChannel channel =
+                    new NotificationChannel(
+                            CHANNEL_ID,
+                            getString(
+                                    R.string.notif_channel
+                            ),
+                            NotificationManager
+                                    .IMPORTANCE_LOW
+                    );
+
+            manager.createNotificationChannel(
+                    channel
+            );
+        }
+
+        Intent stopIntent =
+                new Intent(
+                        this,
+                        ScreenCaptureService.class
+                )
+                        .setAction(
+                                ACTION_STOP
+                        );
+
+        PendingIntent stopPending =
+                PendingIntent.getService(
+                        this,
+                        1,
+                        stopIntent,
+                        PendingIntent
+                                        .FLAG_UPDATE_CURRENT
+                                | PendingIntent
+                                        .FLAG_IMMUTABLE
+                );
+
+        Notification notification =
+                new NotificationCompat.Builder(
+                        this,
+                        CHANNEL_ID
+                )
+                        .setContentTitle(
+                                "OpenCheps Test"
+                        )
+                        .setContentText(
+                                "Zugerkennung + Stockfish aktiv"
+                        )
+                        .setSmallIcon(
+                                R.mipmap.ic_launcher
+                        )
+                        .setOngoing(true)
+                        .addAction(
+                                0,
+                                "Stop",
+                                stopPending
+                        )
+                        .build();
+
+        if (Build.VERSION.SDK_INT
+                >= 29) {
+
+            startForeground(
+                    7,
+                    notification,
+                    ServiceInfo
+                            .FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            );
+
+        } else {
+
+            startForeground(
+                    7,
+                    notification
+            );
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+
+        started = false;
+        paused = true;
+
+        if (worker != null) {
+
+            worker.removeCallbacksAndMessages(
+                    null
+            );
+        }
+
+        if (engine != null) {
+
+            try {
+
+                engine.stop();
+
+            } catch (Exception ignored) {
+            }
+
+            engine = null;
+        }
+
+        engineReady = false;
+
+        if (virtualDisplay != null) {
+
+            try {
+
+                virtualDisplay.release();
+
+            } catch (Exception ignored) {
+            }
+
+            virtualDisplay = null;
+        }
+
+        if (reader != null) {
+
+            try {
+
+                reader.close();
+
+            } catch (Exception ignored) {
+            }
+
+            reader = null;
+        }
+
+        if (projection != null) {
+
+            try {
+
+                projection.stop();
+
+            } catch (Exception ignored) {
+            }
+
+            projection = null;
+        }
+
+        if (workerThread != null) {
+
+            workerThread.quitSafely();
+
+            workerThread = null;
+        }
+
+        stopService(
+                new Intent(
+                        this,
+                        OverlayService.class
+                )
+        );
+
+        super.onDestroy();
+    }
 }
